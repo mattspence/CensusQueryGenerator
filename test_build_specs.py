@@ -267,6 +267,20 @@ class TestEndToEnd:
         assert rc == 2
         assert "missing quotes" in capsys.readouterr().err
 
+    def test_parquet_source_typing(self, tmp_path):
+        import duckdb
+        csv_path = write_persons(tmp_path)
+        pq = tmp_path / "persons.parquet"
+        duckdb.connect().execute(
+            f"COPY (SELECT * FROM read_csv_auto('{csv_path}')) "
+            f"TO '{pq}' (FORMAT PARQUET)"
+        )
+        rc, out = run_main(tmp_path, GOOD_SHELL, "--source", str(pq))
+        assert rc == 0
+        text = out.read_text()
+        assert "RTYPE IN (3, 5)" in text
+        assert "CENRACE" not in text or "'" in text
+
     def test_errors_are_collected_not_first_only(self, tmp_path, capsys):
         body = GOOD_SHELL + "T1,D,1,5,Bad1,NOPE=1\nT1,D,1,6,Bad2,ALSO WRONG\n"
         rc, _ = run_main(tmp_path, body)

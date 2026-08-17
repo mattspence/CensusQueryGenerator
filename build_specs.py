@@ -446,13 +446,22 @@ def write_audit(specs: list[GeneratedSpec], path: Path) -> None:
 # Entry point
 # --------------------------------------------------------------------------
 
+def source_reader(path) -> str:
+    """DuckDB table function for the microdata file, chosen by extension.
+    Specs and table shells are always CSV; this applies only to --source."""
+    suffix = str(path).lower()
+    if suffix.endswith((".parquet", ".pq")):
+        return "read_parquet(?)"
+    return "read_csv_auto(?)"
+
+
 def column_types(source: Path, view: str) -> tuple[set[str], set[str]]:
     """Return (all column names upper-cased, numeric column names upper-cased)."""
     import duckdb
 
     con = duckdb.connect()
     rows = con.execute(
-        "DESCRIBE SELECT * FROM read_csv_auto(?)", [str(source)]
+        f"DESCRIBE SELECT * FROM {source_reader(source)}", [str(source)]
     ).fetchall()
     known = {r[0].upper() for r in rows}
     numeric = {

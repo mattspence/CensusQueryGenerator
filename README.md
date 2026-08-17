@@ -38,6 +38,14 @@ python run_specs.py --specs query_specs.csv --source data/persons.csv \
        --geo CountyGEOID --spine counties.csv --out results.csv
 ```
 
+## Microdata formats
+
+`--source` accepts CSV or Parquet, dispatched by extension (`.parquet` /
+`.pq`). Everything downstream is identical; Parquet is faster to load and
+carries explicit column types, so DuckDB never has to sniff whether a
+zero-padded code column is text. Specs, table shells, and spine files are
+always CSV.
+
 ## Input: the table shell
 
 A CSV with these columns:
@@ -62,13 +70,13 @@ truncating the condition.
 
 ### LDEF grammar
 
-| Form | Translation |
-| ----------------- | ------------- |
-| `VAR=v` | `VAR = v` |
-| `VAR=v1,v2,v3` | `VAR IN (v1, v2, v3)` |
-| `VAR=a:b` | inclusive range, expanded to an `IN` list |
+| Form            | Translation |
+|-----------------|-------------|
+| `VAR=v`         | `VAR = v` |
+| `VAR=v1,v2,v3`  | `VAR IN (v1, v2, v3)` |
+| `VAR=a:b`       | inclusive range, expanded to an `IN` list |
 | `VAR!=v` / `VAR<>v` | `VAR <> v` (lists become `NOT IN`) |
-| `VAR>=v` | `VAR >= v` (also `<=`, `>`, `<`; single value only) |
+| `VAR>=v`        | `VAR >= v` (also `<=`, `>`, `<`; single value only) |
 | `A AND B`, `A OR B` | combined; `AND` binds tighter than `OR` |
 | `(A OR B) AND C` | parentheses respected |
 

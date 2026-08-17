@@ -386,11 +386,20 @@ LEFT JOIN results r
 ORDER BY g.{GEO_COLUMN}, g.table_id, g.row_id"""
 
 
+def source_reader(path) -> str:
+    """DuckDB table function for the microdata file, chosen by extension.
+    Specs and table shells are always CSV; this applies only to --source."""
+    suffix = str(path).lower()
+    if suffix.endswith((".parquet", ".pq")):
+        return "read_parquet(?)"
+    return "read_csv_auto(?)"
+
+
 def register_source(con: duckdb.DuckDBPyConnection, source: SourceConfig) -> None:
     kind = "TABLE" if source.materialize else "VIEW"
     con.execute(
         f"CREATE OR REPLACE {kind} {source.view} AS "
-        f"SELECT * FROM read_csv_auto(?)",
+        f"SELECT * FROM {source_reader(source.path)}",
         [source.path],
     )
 

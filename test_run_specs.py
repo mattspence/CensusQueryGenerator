@@ -98,6 +98,18 @@ class TestLoading:
         rc, out = run_main(tmp_path, rows)
         assert rc == 0 and len(out) == 3
 
+    def test_parquet_source(self, tmp_path):
+        import duckdb
+        csv_path = write_persons(tmp_path)
+        pq = tmp_path / "persons.parquet"
+        duckdb.connect().execute(
+            f"COPY (SELECT * FROM read_csv_auto('{csv_path}')) "
+            f"TO '{pq}' (FORMAT PARQUET)"
+        )
+        rc, rows = run_main(tmp_path, PLAIN_SPECS, persons=pq)
+        assert rc == 0
+        assert [r["n"] for r in rows] == ["36", "18", "18"]
+
     @pytest.mark.parametrize("row,fragment", [
         (("T1", "x", "Bad", "", "SELECT 1 AS n"), "row_id must be an integer"),
         (("T1", 9, "", "", "SELECT 1 AS n"), "empty required field"),
@@ -251,4 +263,3 @@ class TestSpine:
         assert rc == 0
         err = capsys.readouterr().err
         assert "zero on every line" in err and "51999" in err
-
