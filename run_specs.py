@@ -500,7 +500,7 @@ def main(argv: list[str] | None = None) -> int:
                 shown = ", ".join(dead[:5]) + (" ..." if len(dead) > 5 else "")
                 print(f"warning: {len(dead)} spine geograph"
                       f"{'y is' if len(dead) == 1 else 'ies are'} zero on "
-                      f"every line: {shown} — real if truly empty, but also "
+                      f"every line: {shown}. OK if empty geos, but also "
                       f"the signature of a mistyped geoid", file=sys.stderr)
         expected = len(specs) * len(spine)
         if len(df) != expected:
