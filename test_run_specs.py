@@ -110,6 +110,25 @@ class TestLoading:
         assert rc == 0
         assert [r["n"] for r in rows] == ["36", "18", "18"]
 
+    def test_unrecognised_source_extension_fails(self, tmp_path, capsys):
+        import duckdb
+        csv_path = write_persons(tmp_path)
+        dat = tmp_path / "persons.dat"
+        duckdb.connect().execute(
+            f"COPY (SELECT * FROM read_csv_auto('{csv_path}')) "
+            f"TO '{dat}' (FORMAT PARQUET)"
+        )
+        rc, rows = run_main(tmp_path, PLAIN_SPECS, persons=dat)
+        assert rc == 2 and rows == []
+        err = capsys.readouterr().err
+        assert "persons.dat" in err and ".parquet" in err and ".csv" in err
+
+    def test_help_mentions_parquet(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            rs.main(["--help"])
+        assert exc.value.code == 0
+        assert "Parquet" in capsys.readouterr().out
+
     @pytest.mark.parametrize("row,fragment", [
         (("T1", "x", "Bad", "", "SELECT 1 AS n"), "row_id must be an integer"),
         (("T1", 9, "", "", "SELECT 1 AS n"), "empty required field"),

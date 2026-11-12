@@ -27,6 +27,10 @@ LDEF grammar understood:
 
 Anything else is an error naming the table and line, never a silent guess.
 
+With --source, LDEF variables are checked against the microdata's columns and
+literals are typed from them (numeric columns unquoted, text quoted). The
+microdata may be CSV or Parquet, chosen by file extension.
+
 With --geo, every generated query aggregates by a geographic identifier
 instead of returning a single national figure. Pass a concrete column name to
 bake it in, or the literal "{geo}" to leave a placeholder that run_specs.py
@@ -35,6 +39,7 @@ fills at run time, so one spec file serves every geography level.
 Usage:
     python build_specs.py --shell table_shell.csv --out query_specs.csv
     python build_specs.py --shell table_shell.csv --source data/individuals.csv
+    python build_specs.py --shell table_shell.csv --source data/individuals.parquet
     python build_specs.py --shell table_shell.csv --geo "{geo}"   # geography at run time
     python build_specs.py --shell table_shell.csv --geo StateGEOID
     python build_specs.py --shell table_shell.csv --audit lineage.csv
@@ -48,6 +53,8 @@ import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from microdata import SourceError, is_numeric_type, source_reader
 
 MAX_RANGE = 500          # refuse to expand absurd ranges into IN lists
 COMPARISONS = (">=", "<=", ">", "<")
@@ -446,15 +453,6 @@ def write_audit(specs: list[GeneratedSpec], path: Path) -> None:
 # Entry point
 # --------------------------------------------------------------------------
 
-def source_reader(path) -> str:
-    """DuckDB table function for the microdata file, chosen by extension.
-    Specs and table shells are always CSV; this applies only to --source."""
-    suffix = str(path).lower()
-    if suffix.endswith((".parquet", ".pq")):
-        return "read_parquet(?)"
-    return "read_csv_auto(?)"
-
-
 def column_types(source: Path, view: str) -> tuple[set[str], set[str]]:
     """Return (all column names upper-cased, numeric column names upper-cased)."""
     import duckdb
@@ -464,11 +462,7 @@ def column_types(source: Path, view: str) -> tuple[set[str], set[str]]:
         f"DESCRIBE SELECT * FROM {source_reader(source)}", [str(source)]
     ).fetchall()
     known = {r[0].upper() for r in rows}
-    numeric = {
-        r[0].upper() for r in rows
-        if any(t in r[1].upper() for t in
-               ("INT", "DECIMAL", "DOUBLE", "FLOAT", "REAL", "HUGEINT"))
-    }
+    numeric = {r[0].upper() for r in rows if is_numeric_type(r[1])}
     return known, numeric
 
 
@@ -477,8 +471,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--shell", type=Path, default=Path("table_shell.csv"))
     ap.add_argument("--out", type=Path, default=Path("query_specs.csv"))
     ap.add_argument("--source", type=Path,
-                    help="records CSV; if given, LDEF variables are checked "
-                         "against its columns and literals typed accordingly")
+                    help="microdata file, CSV or Parquet (by extension); if "
+                         "given, LDEF variables are checked against its columns "
+                         "and literals typed accordingly")
     ap.add_argument("--view", default="recs",
                     help="table name the generated SQL refers to")
     ap.add_argument("--measure", default="count(*) AS n",
@@ -500,7 +495,11 @@ def main(argv: list[str] | None = None) -> int:
 
     known_columns = numeric_columns = None
     if args.source:
-        known_columns, numeric_columns = column_types(args.source, args.view)
+        try:
+            known_columns, numeric_columns = column_types(args.source, args.view)
+        except SourceError as exc:
+            print(exc, file=sys.stderr)
+            return 2
     numeric_columns = numeric_columns or set()
 
     if args.geo and args.geo != "{geo}":

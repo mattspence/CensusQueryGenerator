@@ -36,6 +36,22 @@ def write_persons(tmp_path: Path) -> Path:
     return p
 
 
+def write_persons_parquet(tmp_path: Path, name="persons.parquet") -> Path:
+    """Same rows as write_persons, with column types fixed explicitly so the
+    test exercises Parquet typing rather than whatever the CSV sniffer chose."""
+    import duckdb
+    csv_path = write_persons(tmp_path)
+    pq = tmp_path / name
+    duckdb.connect().execute(
+        f"COPY (SELECT person_id::INTEGER AS person_id, RTYPE::INTEGER AS RTYPE, "
+        f"CENRACE::VARCHAR AS CENRACE, RELSHIP::INTEGER AS RELSHIP, "
+        f"QSEX::INTEGER AS QSEX, QAGE::INTEGER AS QAGE "
+        f"FROM read_csv_auto('{csv_path}', all_varchar=true)) "
+        f"TO '{pq}' (FORMAT PARQUET)"
+    )
+    return pq
+
+
 def run_main(tmp_path, shell_body, *extra):
     shell = write_shell(tmp_path, shell_body)
     out = tmp_path / "specs.csv"
@@ -268,18 +284,45 @@ class TestEndToEnd:
         assert "missing quotes" in capsys.readouterr().err
 
     def test_parquet_source_typing(self, tmp_path):
-        import duckdb
-        csv_path = write_persons(tmp_path)
-        pq = tmp_path / "persons.parquet"
-        duckdb.connect().execute(
-            f"COPY (SELECT * FROM read_csv_auto('{csv_path}')) "
-            f"TO '{pq}' (FORMAT PARQUET)"
-        )
-        rc, out = run_main(tmp_path, GOOD_SHELL, "--source", str(pq))
+        """Parquet types come from the file, not the CSV sniffer: a text
+        code column with leading zeros must stay quoted, numerics unquoted."""
+        pq = write_persons_parquet(tmp_path)
+        body = GOOD_SHELL + 'T1,D,2,5,White or Black,"CENRACE=01,02"\n'
+        rc, out = run_main(tmp_path, body, "--source", str(pq))
         assert rc == 0
         text = out.read_text()
         assert "RTYPE IN (3, 5)" in text
-        assert "CENRACE" not in text or "'" in text
+        assert "CENRACE IN ('01', '02')" in text
+
+    def test_parq_extension_accepted(self, tmp_path):
+        pq = write_persons_parquet(tmp_path, name="persons.parq")
+        rc, out = run_main(tmp_path, GOOD_SHELL, "--source", str(pq))
+        assert rc == 0
+        assert "RTYPE IN (3, 5)" in out.read_text()
+
+    def test_unrecognised_source_extension_fails(self, tmp_path, capsys):
+        pq = write_persons_parquet(tmp_path, name="persons.dat")
+        rc, _ = run_main(tmp_path, GOOD_SHELL, "--source", str(pq))
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "persons.dat" in err and ".parquet" in err and ".csv" in err
+
+    def test_interval_column_is_not_numeric(self, tmp_path):
+        import duckdb
+        pq = tmp_path / "durations.parquet"
+        duckdb.connect().execute(
+            f"COPY (SELECT 1::INTEGER AS RTYPE, INTERVAL 5 DAY AS DUR, "
+            f"1.5::DECIMAL(18,3) AS WGT) TO '{pq}' (FORMAT PARQUET)"
+        )
+        known, numeric = bs.column_types(pq, "recs")
+        assert known == {"RTYPE", "DUR", "WGT"}
+        assert numeric == {"RTYPE", "WGT"}
+
+    def test_help_mentions_parquet(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            bs.main(["--help"])
+        assert exc.value.code == 0
+        assert "Parquet" in capsys.readouterr().out
 
     def test_errors_are_collected_not_first_only(self, tmp_path, capsys):
         body = GOOD_SHELL + "T1,D,1,5,Bad1,NOPE=1\nT1,D,1,6,Bad2,ALSO WRONG\n"

@@ -13,6 +13,7 @@ Usage:
     python run_specs.py                         # run with defaults
     python run_specs.py --specs other.csv       # different spec file
     python run_specs.py --source data/2020.csv  # different input records
+    python run_specs.py --source data/2020.parquet   # CSV or Parquet, by extension
     python run_specs.py --check                 # validate only, run nothing
     python run_specs.py --print-sql             # dump the master query
     python run_specs.py --geo StateGEOID        # fill the {geo} placeholder
@@ -32,6 +33,8 @@ from dataclasses import dataclass, fields, replace
 from pathlib import Path
 
 import duckdb
+
+from microdata import SourceError, source_reader
 
 # Label columns prepended to every subquery, in output order.
 LABEL_COLUMNS = ("table_id", "row_id", "row_desc", "universe", "geo_level")
@@ -386,15 +389,6 @@ LEFT JOIN results r
 ORDER BY g.{GEO_COLUMN}, g.table_id, g.row_id"""
 
 
-def source_reader(path) -> str:
-    """DuckDB table function for the microdata file, chosen by extension.
-    Specs and table shells are always CSV; this applies only to --source."""
-    suffix = str(path).lower()
-    if suffix.endswith((".parquet", ".pq")):
-        return "read_parquet(?)"
-    return "read_csv_auto(?)"
-
-
 def register_source(con: duckdb.DuckDBPyConnection, source: SourceConfig) -> None:
     kind = "TABLE" if source.materialize else "VIEW"
     con.execute(
@@ -413,7 +407,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--specs", type=Path, default=Path("query_specs.csv"),
                     help="CSV of query specs")
     ap.add_argument("--source", default="data/individuals.csv",
-                    help="CSV of individual records")
+                    help="microdata file of individual records, CSV or "
+                         "Parquet (by extension)")
     ap.add_argument("--view", default="recs",
                     help="name the specs' SQL refers to")
     ap.add_argument("--no-materialize", action="store_true",
@@ -450,7 +445,11 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     con = duckdb.connect()
-    register_source(con, source)
+    try:
+        register_source(con, source)
+    except SourceError as exc:
+        print(exc, file=sys.stderr)
+        return 2
 
     errors, warnings, column_sets = validate_against_db(con, specs)
     grouped = any(GEO_COLUMN in cols for cols in column_sets.values())

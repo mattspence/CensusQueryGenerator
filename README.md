@@ -40,11 +40,15 @@ python run_specs.py --specs query_specs.csv --source data/persons.csv \
 
 ## Microdata formats
 
-`--source` accepts CSV or Parquet, dispatched by extension (`.parquet` /
-`.pq`). Everything downstream is identical; Parquet is faster to load and
+`--source` accepts CSV or Parquet, dispatched by extension: `.parquet`,
+`.pq` or `.parq` is read as Parquet; `.csv`, `.tsv` or `.txt` (optionally
+`.gz` or `.zst` compressed) as CSV. Any other extension is rejected up front
+with a message naming the accepted ones, rather than being fed to the CSV
+sniffer. Everything downstream is identical; Parquet is faster to load and
 carries explicit column types, so DuckDB never has to sniff whether a
 zero-padded code column is text. Specs, table shells, and spine files are
-always CSV.
+always CSV. The dispatch lives in `microdata.py`, shared by both scripts so
+they can never disagree about how a source is read.
 
 ## Input: the table shell
 
