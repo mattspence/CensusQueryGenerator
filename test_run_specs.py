@@ -282,3 +282,185 @@ class TestSpine:
         assert rc == 0
         err = capsys.readouterr().err
         assert "zero on every line" in err and "51999" in err
+
+    def test_microdata_geography_missing_from_spine_warns(self, tmp_path, capsys):
+        spine = write_spine(tmp_path, ["11001", "11003"])      # no 24001
+        rc, rows = run_main(tmp_path, GEO_SPECS, "--geo", "CountyGEOID",
+                            "--spine", str(spine))
+        assert rc == 0 and {r["geoid"] for r in rows} == {"11001", "11003"}
+        err = capsys.readouterr().err
+        assert "not in the spine" in err and "24001" in err
+
+    def test_spec_with_two_rows_per_geography_fails(self, tmp_path, capsys):
+        # grouping by more than the geography would repeat cells in the join
+        specs = [("T1", 1, "Total", "",
+                  "SELECT {geo} AS geoid, count(*) AS n FROM recs "
+                  "GROUP BY {geo}, QSEX")]
+        spine = write_spine(tmp_path, ["11001", "11003", "24001"])
+        rc, rows = run_main(tmp_path, specs, "--geo", "CountyGEOID",
+                            "--spine", str(spine))
+        assert rc == 2 and rows == []                  # nothing written
+        assert "T1/1: returns more than one row" in capsys.readouterr().err
+
+    def test_spine_with_geoid_among_other_columns(self, tmp_path):
+        spine = tmp_path / "spine.csv"
+        spine.write_text("name,GEOID\nA,11001\nB,51999\n")
+        rc, rows = run_main(tmp_path, GEO_SPECS, "--geo", "CountyGEOID",
+                            "--spine", str(spine))
+        assert rc == 0 and {r["geoid"] for r in rows} == {"11001", "51999"}
+
+    def test_spine_bom_blank_lines_and_padding_tolerated(self, tmp_path):
+        spine = tmp_path / "spine.csv"
+        spine.write_text("﻿geoid\n11001 \n\n51999\n", encoding="utf-8")
+        rc, rows = run_main(tmp_path, GEO_SPECS, "--geo", "CountyGEOID",
+                            "--spine", str(spine))
+        assert rc == 0 and {r["geoid"] for r in rows} == {"11001", "51999"}
+
+    @pytest.mark.parametrize("text, fragment", [
+        ("", "empty"),
+        ("geoid\n", "no geographies"),
+        ("a,b\n1,2\n", "expected a single column"),
+    ])
+    def test_bad_spine_files_rejected(self, tmp_path, capsys, text, fragment):
+        spine = tmp_path / "spine.csv"
+        spine.write_text(text)
+        rc, _ = run_main(tmp_path, GEO_SPECS, "--geo", "CountyGEOID",
+                         "--spine", str(spine))
+        assert rc == 2
+        assert fragment in capsys.readouterr().err
+
+    def test_large_spine(self, tmp_path):
+        # 100,000 geographies: took minutes when the spine was a Python list
+        # checked for duplicates pairwise and pasted into the SQL as literals.
+        geos = ["11001", "11003", "24001"] + [f"{i:05d}" for i in range(60000, 99997)]
+        spine = write_spine(tmp_path, geos)
+        rc, rows = run_main(tmp_path, GEO_SPECS[:1], "--geo", "CountyGEOID",
+                            "--spine", str(spine))
+        assert rc == 0 and len(rows) == 40000
+        assert sum(int(r["n"]) for r in rows) == 36
+
+    def test_print_sql_shows_every_statement(self, tmp_path, capsys):
+        spine = write_spine(tmp_path, ["11001"])
+        rc, rows = run_main(tmp_path, GEO_SPECS, "--geo", "CountyGEOID",
+                            "--spine", str(spine), "--print-sql", "--check")
+        assert rc == 0 and rows == []
+        out = capsys.readouterr().out
+        assert "TEMP TABLE lines" in out and "TEMP TABLE results" in out
+        assert "CROSS JOIN spine" in out
+
+
+# --------------------------------------------------------------------------
+# output: streaming, Parquet, label lookup, sorting
+# --------------------------------------------------------------------------
+
+def read_parquet(path):
+    import duckdb
+    rel = duckdb.connect().execute(f"SELECT * FROM read_parquet('{path}')")
+    names = [d[0] for d in rel.description]
+    return [dict(zip(names, row)) for row in rel.fetchall()]
+
+
+class TestOutput:
+    def test_parquet_output(self, tmp_path):
+        out = tmp_path / "out.parquet"
+        rc, _ = run_main(tmp_path, GEO_SPECS, "--geo", "CountyGEOID",
+                         "--out", str(out))
+        assert rc == 0
+        rows = read_parquet(out)
+        assert len(rows) == 9
+        assert rows[0] == {"table_id": "T1", "row_id": 1, "row_desc": "Total",
+                           "universe": None, "geo_level": "CountyGEOID",
+                           "geoid": 11001, "n": 12}
+
+    def test_labels_move_to_lookup_file(self, tmp_path):
+        labels = tmp_path / "lines.csv"
+        specs = [("T1", 1, "Total, all ages", "Total population",
+                  "SELECT count(*) AS n FROM recs")]
+        rc, rows = run_main(tmp_path, specs, "--labels", str(labels))
+        assert rc == 0
+        assert rows == [{"table_id": "T1", "row_id": "1", "geo_level": "", "n": "60"}]
+        assert list(csv.DictReader(labels.open())) == [
+            {"table_id": "T1", "row_id": "1", "row_desc": "Total, all ages",
+             "universe": "Total population"}]
+
+    def test_labels_with_spine(self, tmp_path):
+        spine = write_spine(tmp_path, ["11001", "51999"])
+        rc, rows = run_main(tmp_path, GEO_SPECS, "--geo", "CountyGEOID",
+                            "--spine", str(spine),
+                            "--labels", str(tmp_path / "lines.csv"))
+        assert rc == 0 and len(rows) == 6
+        assert list(rows[0]) == ["table_id", "row_id", "geo_level", "geoid", "n"]
+
+    def test_labels_not_written_on_check(self, tmp_path):
+        labels = tmp_path / "lines.csv"
+        rc, _ = run_main(tmp_path, PLAIN_SPECS, "--labels", str(labels), "--check")
+        assert rc == 0 and not labels.exists()
+
+    @pytest.mark.parametrize("spine", [False, True])
+    def test_no_sort_gives_same_rows(self, tmp_path, spine):
+        extra = ["--geo", "CountyGEOID"]
+        if spine:
+            extra += ["--spine", str(write_spine(tmp_path, ["11001", "51999"]))]
+        _, ordered = run_main(tmp_path, GEO_SPECS, *extra)
+        _, unordered = run_main(tmp_path, GEO_SPECS, *extra, "--no-sort")
+        key = lambda r: (r["geoid"], r["row_id"])
+        assert ordered == sorted(ordered, key=key)
+        assert sorted(unordered, key=key) == ordered
+
+    def test_stdout_when_no_out(self, tmp_path, capsys):
+        specs = write_specs(tmp_path, PLAIN_SPECS)
+        rc = rs.main(["--specs", str(specs), "--source", str(write_persons(tmp_path))])
+        assert rc == 0
+        assert "Female" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------
+# source registration: table or view
+# --------------------------------------------------------------------------
+
+def write_persons_parquet(tmp_path: Path, name="persons.parquet") -> Path:
+    import duckdb
+    pq = tmp_path / name
+    duckdb.connect().execute(
+        f"COPY (SELECT * FROM read_csv_auto('{write_persons(tmp_path)}')) "
+        f"TO '{pq}' (FORMAT PARQUET)"
+    )
+    return pq
+
+
+class TestSourceRegistration:
+    @pytest.mark.parametrize("parquet, materialize, expected", [
+        (True, None, "VIEW"),          # Parquet stays on disk
+        (False, None, "BASE TABLE"),   # CSV is parsed once
+        (True, True, "BASE TABLE"),
+        (False, False, "VIEW"),
+    ])
+    def test_table_or_view(self, tmp_path, parquet, materialize, expected):
+        import duckdb
+        path = write_persons_parquet(tmp_path) if parquet else write_persons(tmp_path)
+        con = duckdb.connect()
+        rs.register_source(con, rs.SourceConfig(str(path), materialize=materialize))
+        kind = con.execute("SELECT table_type FROM information_schema.tables "
+                           "WHERE table_name = 'recs'").fetchone()[0]
+        assert kind == expected
+        assert con.execute("SELECT count(*) FROM recs").fetchone()[0] == 60
+
+    @pytest.mark.parametrize("flag", ["--materialize", "--no-materialize"])
+    def test_flags_run_end_to_end(self, tmp_path, flag):
+        rc, rows = run_main(tmp_path, PLAIN_SPECS, flag)
+        assert rc == 0 and [r["n"] for r in rows] == ["36", "18", "18"]
+
+    def test_parquet_glob_source(self, tmp_path):
+        # one file per state is the natural layout for a national run
+        data = tmp_path / "data"
+        data.mkdir()
+        write_persons_parquet(data, "a.parquet")
+        write_persons_parquet(data, "b.parquet")
+        rc, rows = run_main(tmp_path, PLAIN_SPECS, persons=data / "*.parquet")
+        assert rc == 0 and [r["n"] for r in rows] == ["72", "36", "36"]
+
+    def test_source_path_with_quote(self, tmp_path):
+        odd = tmp_path / "it's here"
+        odd.mkdir()
+        rc, rows = run_main(tmp_path, PLAIN_SPECS, persons=write_persons(odd))
+        assert rc == 0 and len(rows) == 3
