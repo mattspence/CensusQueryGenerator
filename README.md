@@ -38,6 +38,8 @@ python run_specs.py --specs query_specs.csv --source data/persons.csv \
        --geo CountyGEOID --spine counties.csv --out results.csv
 ```
 
+For national block-level runs, see [Running at scale](#running-at-scale).
+
 ## Microdata formats
 
 `--source` accepts CSV or Parquet, dispatched by extension: `.parquet`,
@@ -46,8 +48,9 @@ python run_specs.py --specs query_specs.csv --source data/persons.csv \
 with a message naming the accepted ones, rather than being fed to the CSV
 sniffer. Everything downstream is identical; Parquet is faster to load and
 carries explicit column types, so DuckDB never has to sniff whether a
-zero-padded code column is text. Specs, table shells, and spine files are
-always CSV. The dispatch lives in `microdata.py`, shared by both scripts so
+zero-padded code column is text. A Parquet `--source` may also be a glob
+(`"data/state=06/*.parquet"`) covering many files. Specs, table shells, and
+spine files are always CSV. The dispatch lives in `microdata.py`, shared by both scripts so
 they can never disagree about how a source is read.
 
 ## Input: the table shell
@@ -133,7 +136,35 @@ runs the result as a single statement.
    not an error. `--strict` promotes warnings to failures.
 
 `--check` runs all validation and stops; `--print-sql` dumps the master
-query for inspection.
+query for inspection (with `--spine`, every statement that would run).
+
+### Output (`--out`, `--labels`, `--no-sort`)
+
+`--out` is written by DuckDB as the query runs, so the results never have to
+fit in memory: Parquet if the name ends in `.parquet`, `.pq` or `.parq`,
+otherwise CSV. Without `--out` the rows are collected and printed, which is
+only sensible for small runs.
+
+By default every result row repeats its line's `row_desc` and `universe`.
+`--labels lines.csv` writes those once per line to a small lookup file
+instead, leaving the results as `table_id, row_id, geo_level, geoid` plus
+the measures:
+
+```sql
+SELECT * FROM 'results.parquet' JOIN 'lines.csv' USING (table_id, row_id)
+```
+
+`--no-sort` skips the final `ORDER BY`. Sorting is what makes each area's
+table read as a block, but it is the one step whose memory grows with the
+size of the output.
+
+### How the microdata is loaded (`--materialize`)
+
+A Parquet source is queried in place: DuckDB reads only the columns the
+specs mention, so the file can be far larger than memory. A CSV source is
+loaded once into an in-memory table, because re-parsing the text for every
+spec would dominate the run. `--materialize` and `--no-materialize` override
+either default.
 
 ### Geography (`--geo`)
 
@@ -169,15 +200,74 @@ guaranteeing a row per cell — including lines that are zero in *every*
 geography, which would vanish from any grid derived from the results
 themselves.
 
+The spine, the line list and the un-filled results are DuckDB temporary
+tables (`spine`, `lines`, `results`), and every check below is a SQL query
+over them, so a spine of millions of blocks is handled the same way as one
+of fifty states.
+
 Only columns named in `--zero-fill` (default `n`) are coalesced to 0; other
 measures stay NULL, because an empty cell has a count of zero but an
-undefined mean. Guardrails: duplicate spine GEOIDs are rejected (the cross
-join would multiply counts), the final row count is asserted to equal
-lines x geographies, and a geography that is zero on every line draws a
-warning — real if the area is truly empty, but also the signature of a
-mistyped GEOID. Use a canonical geography list (e.g. derived from TIGER)
-rather than a hand-typed one; the spine must be external because the
-microdata can only name areas that already contain someone.
+undefined mean. Guardrails, all applied before anything is written:
+
+- duplicate spine GEOIDs are rejected (the cross join would multiply counts);
+- a spec that returns more than one row for a geography is rejected, which
+  is what guarantees the output is exactly lines x geographies;
+- a geography that is zero on every line draws a warning — real if the area
+  is truly empty, but also the signature of a mistyped GEOID;
+- a geography present in the microdata but absent from the spine draws a
+  warning, because its people are left out of the output.
+
+Use a canonical geography list (e.g. derived from TIGER) rather than a
+hand-typed one; the spine must be external because the microdata can only
+name areas that already contain someone.
+
+## Running at scale
+
+For something like every block in the country (~330 million person records,
+~8 million blocks, hundreds of lines):
+
+1. **Convert the microdata to Parquet once**, ideally one file or directory
+   per state. Parquet is read in place and only the needed columns are
+   touched; a national CSV would be loaded whole into memory.
+
+   ```sql
+   COPY (SELECT * FROM read_csv_auto('persons.csv'))
+   TO 'persons' (FORMAT PARQUET, PARTITION_BY (StateGEOID));
+   ```
+
+2. **Write Parquet, move the labels out, skip the sort**:
+
+   ```bash
+   python run_specs.py --specs query_specs.csv --source "persons/*/*.parquet" \
+          --geo BlockGEOID --out results.parquet --labels lines.csv --no-sort
+   ```
+
+3. **Or run one state at a time.** Blocks nest within states, so the pieces
+   simply sit side by side. Each run is small, a failure costs one state
+   rather than the whole job, and per-state sorting is cheap:
+
+   ```bash
+   for dir in persons/StateGEOID=*; do
+       python run_specs.py --specs query_specs.csv --source "$dir/*.parquet" \
+              --geo BlockGEOID --labels lines.csv \
+              --out "results/$(basename "$dir").parquet"
+   done
+   ```
+
+   `SELECT * FROM 'results/*.parquet'` then reads them as one table.
+
+4. **Think twice about `--spine` at block level.** A dense grid is
+   lines x 8 million blocks — billions of rows, mostly zeros. Without a
+   spine the output holds only non-empty cells, and a missing cell *is* a
+   zero; fill them in when a table is assembled for publication. If you do
+   want dense block output, run it per state with a per-state spine.
+
+Measured on a 4-core, 16 GB machine with 20 million synthetic records,
+500,000 blocks and 100 lines: 13 seconds and 0.3 GB of memory for the
+sparse Parquet output (step 2), and 19 seconds for the dense 50-million-row
+grid unsorted. Sorting that dense grid needed about 4 GB, which is why
+`--no-sort` or per-state runs are the advice for anything large. Time
+grows roughly in proportion to records x lines.
 
 ## Reviewing the translation (`--audit`)
 
@@ -189,33 +279,39 @@ publishing.
 ## Testing
 
 ```bash
-pytest -q      # 73 tests, ~1 second
+pytest -q      # 130 tests, a few seconds
 ```
 
 `test_build_specs.py` covers LDEF translation (every operator and every
 rejected form), hierarchy resolution (dedents, sibling replacement, jumps,
 orphans), source typing, and end-to-end generation. `test_run_specs.py`
-covers spec loading, all validation layers, geography, and spine
-densification, including the empty-geography and line-zero-everywhere cases.
+covers spec loading, all validation layers, geography, spine densification
+(including the empty-geography and line-zero-everywhere cases), streamed
+CSV and Parquet output, the label lookup, and table-versus-view loading.
 
 ## Flag reference
 
 `build_specs.py`: `--shell` `--out` `--source` `--view` `--measure`
 `--geo` `--audit` `--check`
 
-`run_specs.py`: `--specs` `--source` `--view` `--no-materialize` `--out`
-`--geo` `--spine` `--zero-fill` `--check` `--print-sql` `--strict`
+`run_specs.py`: `--specs` `--source` `--view` `--materialize` /
+`--no-materialize` `--out` `--labels` `--no-sort` `--geo` `--spine`
+`--zero-fill` `--check` `--print-sql` `--strict`
 
 Run either with `--help` for details. `--measure` (default `count(*) AS n`)
 sets the select list for every generated query — e.g. a weighted sum.
-`--no-materialize` registers the microdata as a view instead of an in-memory
-table; the default table is usually faster when many specs scan it.
 
 ## Known limitations
 
-- Every subquery scans the full microdata table. DuckDB makes this fast, but
-  with hundreds of lines on very large files, a single-scan
-  `count(*) FILTER (WHERE ...)` formulation would be the next optimization.
+- Every subquery scans the microdata, so run time grows with records x
+  lines. A single-scan `count(*) FILTER (WHERE ...)` formulation was tried
+  and was slower (11.7 s against 6.2 s for 100 lines over 20 million
+  records): one query per line lets DuckDB discard non-matching rows before
+  aggregating, and keeps each line's SQL readable on its own.
+- The final sort needs memory in proportion to the output. Use `--no-sort`,
+  or run state by state, when the output is large.
+- With `--spine`, the un-filled results are held in a temporary table
+  (spilling to disk when large) so they can be checked before writing.
 - A mistyped spine GEOID yields a plausible block of zeros; the
   dead-geography warning is the only guard, so source spines from a
   canonical list.

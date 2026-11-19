@@ -21,6 +21,14 @@ Usage:
     python run_specs.py --geo CountyGEOID --spine counties.csv
                                                 # zero-fill every line for
                                                 # every geography in the spine
+    python run_specs.py --geo BlockGEOID --out results.parquet \
+                        --labels lines.csv --no-sort
+                                                # large run: stream to Parquet,
+                                                # line labels in a lookup file
+
+Results are streamed to --out by DuckDB (Parquet or CSV, by extension), so
+the result set never has to fit in memory. Only when there is no --out are
+the rows collected and printed.
 """
 
 from __future__ import annotations
@@ -34,10 +42,17 @@ from pathlib import Path
 
 import duckdb
 
-from microdata import SourceError, source_reader
+from microdata import PARQUET_SUFFIXES, SourceError, source_reader
 
 # Label columns prepended to every subquery, in output order.
 LABEL_COLUMNS = ("table_id", "row_id", "row_desc", "universe", "geo_level")
+
+# With --labels the descriptive text moves to a lookup file keyed by
+# table_id/row_id, and the results carry only these.
+SLIM_LABEL_COLUMNS = ("table_id", "row_id", "geo_level")
+
+# The lookup file's columns: one row per line, not one per result row.
+LINE_COLUMNS = ("table_id", "row_id", "row_desc", "universe")
 
 # Specs generated with a deferred geography carry this token; --geo fills it.
 # The resulting column comes out of the subquery, so it is not a label column.
@@ -69,7 +84,8 @@ class SourceConfig:
 
     path: str
     view: str = "recs"
-    materialize: bool = True
+    # None picks by format: see register_source.
+    materialize: bool | None = None
 
 
 class SpecError(Exception):
@@ -285,117 +301,246 @@ def sql_literal(value: str | None) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def label_values(s: QuerySpec, geo: str | None) -> dict[str, str]:
+    """SQL literal for each label column of one spec."""
+    return {
+        "table_id": sql_literal(s.table_id),
+        "row_id": str(s.row_id),
+        "row_desc": sql_literal(s.row_desc),
+        "universe": sql_literal(s.universe),
+        "geo_level": sql_literal(geo),
+    }
+
+
 def build_master(specs: list[QuerySpec], geo: str | None = None,
-                 grouped: bool = False) -> str:
+                 grouped: bool = False,
+                 labels: tuple[str, ...] = LABEL_COLUMNS,
+                 sort: bool = True) -> str:
     parts = []
     for s in specs:
-        labels = (
-            f"{sql_literal(s.table_id)} AS table_id, "
-            f"{s.row_id} AS row_id, "
-            f"{sql_literal(s.row_desc)} AS row_desc, "
-            f"{sql_literal(s.universe)} AS universe, "
-            f"{sql_literal(geo)} AS geo_level"
-        )
+        values = label_values(s, geo)
+        select = ", ".join(f"{values[c]} AS {c}" for c in labels)
         body = s.sql.strip().rstrip(";")
-        parts.append(f"-- {s.key}\nSELECT {labels}, sub.*\nFROM (\n{body}\n) AS sub")
+        parts.append(f"-- {s.key}\nSELECT {select}, sub.*\nFROM (\n{body}\n) AS sub")
 
-    # With a geography, one table's lines for a single area should read
-    # together, so the area sorts first.
-    order = f"{GEO_COLUMN}, table_id, row_id" if grouped else "table_id, row_id"
-    return "\n\nUNION ALL BY NAME\n\n".join(parts) + f"\n\nORDER BY {order}"
+    master = "\n\nUNION ALL BY NAME\n\n".join(parts)
+    if sort:
+        # With a geography, one table's lines for a single area should read
+        # together, so the area sorts first.
+        order = f"{GEO_COLUMN}, table_id, row_id" if grouped else "table_id, row_id"
+        master += f"\n\nORDER BY {order}"
+    return master
 
 
-def load_spine(path: Path) -> list[str]:
-    """Read the geography list: a one-column CSV, or one with a geoid column."""
+def write_labels(specs: list[QuerySpec], path: Path) -> None:
+    """Write the line lookup that --labels leaves out of the results."""
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(LINE_COLUMNS)
+        for s in specs:
+            writer.writerow([s.table_id, s.row_id, s.row_desc, s.universe or ""])
+
+
+# --------------------------------------------------------------------------
+# Spine densification
+#
+# Everything here is SQL over three temporary tables: `spine` (the --spine
+# file), `lines` (one row per spec) and `results` (the union of every spec,
+# before zero-filling). The spine and the results are never pulled into
+# Python, so a spine of millions of blocks costs the same few lines of code
+# as one of fifty states.
+#
+# They are real tables rather than inline VALUES lists or CTEs because DuckDB
+# then knows their sizes, and so plans the big join around the small side.
+# --------------------------------------------------------------------------
+
+def load_spine(con: duckdb.DuckDBPyConnection, path: Path) -> int:
+    """Load the geography list into the temp table `spine`; return its size.
+
+    Accepts a one-column CSV (header optional) or any CSV with a geoid column.
+    Python reads only the first row, to find the column; DuckDB reads the rest.
+    """
     with path.open(newline="", encoding="utf-8-sig") as fh:
         reader = csv.reader(fh)
-        rows = [r for r in reader if any(c.strip() for c in r)]
-    if not rows:
+        first = next((r for r in reader if any(c.strip() for c in r)), None)
+        lines_before_data = reader.line_num
+    if first is None:
         raise SpecError([f"{path}: spine file is empty"])
-    header = [c.strip() for c in rows[0]]
+
+    header = [c.strip() for c in first]
     if GEO_COLUMN in [c.lower() for c in header]:
         idx = [c.lower() for c in header].index(GEO_COLUMN)
-        values = [r[idx].strip() for r in rows[1:]]
     elif len(header) == 1:
-        # Single column: treat the first row as data unless it looks like a name.
-        values = [r[0].strip() for r in rows]
-        if values and not re.fullmatch(r"[0-9]+", values[0]):
-            values = values[1:]
+        idx = 0
+        # Single column: the first row is data unless it looks like a name.
+        if re.fullmatch(r"[0-9]+", header[0]):
+            lines_before_data -= 1
     else:
         raise SpecError(
             [f"{path}: expected a single column or a '{GEO_COLUMN}' column, "
              f"got {header}"]
         )
-    values = [v for v in values if v]
-    if not values:
+
+    names = [f"c{i}" for i in range(len(header))]
+    con.execute(
+        f"""CREATE OR REPLACE TEMP TABLE spine AS
+            SELECT trim(c{idx}) AS {GEO_COLUMN}
+            FROM read_csv({sql_literal(str(path))}, header = false,
+                          all_varchar = true, delim = ',', names = {names},
+                          skip = {lines_before_data})
+            WHERE trim(c{idx}) <> ''"""
+    )
+
+    size = con.execute("SELECT count(*) FROM spine").fetchone()[0]
+    if size == 0:
         raise SpecError([f"{path}: no geographies found"])
-    dupes = {v for v in values if values.count(v) > 1}
+    dupes = con.execute(
+        f"""SELECT {GEO_COLUMN} FROM spine GROUP BY {GEO_COLUMN}
+            HAVING count(*) > 1 ORDER BY {GEO_COLUMN} LIMIT 5"""
+    ).fetchall()
     if dupes:
-        raise SpecError([f"{path}: duplicate geoid(s) {sorted(dupes)[:5]}"])
-    return values
+        raise SpecError([f"{path}: duplicate geoid(s) {[d[0] for d in dupes]}"])
+    return size
 
 
-def build_densified(specs: list[QuerySpec], master: str, spine: list[str],
-                    geo: str | None, zero_fill: list[str]) -> str:
-    """Wrap the master query so every (line, geography) pair yields a row.
+def count_and_sample(con: duckdb.DuckDBPyConnection, query: str) -> tuple[int, str]:
+    """How many rows a one-column query returns, and the first few as text."""
+    rows = con.execute(
+        f"SELECT count(*) OVER (), * FROM ({query}) ORDER BY 2 LIMIT 5"
+    ).fetchall()
+    if not rows:
+        return 0, ""
+    total = rows[0][0]
+    return total, ", ".join(r[1] for r in rows) + (" ..." if total > 5 else "")
 
-    The line grid comes from the SPECS, not from the results: a line that is
-    zero in every geography contributes nothing to the union, so deriving the
-    grid from results would drop it entirely. Likewise the spine is external
-    because the microdata can only name geographies that already contain
-    someone. Count measures are coalesced to 0; everything else stays NULL,
-    since an empty cell has a count of zero but an undefined mean.
-    """
-    body = master.rsplit("ORDER BY", 1)[0].rstrip()
 
-    line_rows = ",\n    ".join(
-        f"({sql_literal(s.table_id)}, {s.row_id}, {sql_literal(s.row_desc)}, "
-        f"{sql_literal(s.universe)})"
+def check_results_against_spine(
+    con: duckdb.DuckDBPyConnection, zero_fill: list[str]
+) -> tuple[list[str], list[str]]:
+    """Compare the `results` and `spine` tables. Returns (errors, warnings)."""
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    # Each spec must give one row per geography: the densifying join would
+    # otherwise repeat the cell, and the output would no longer be exactly
+    # lines x geographies.
+    repeated = con.execute(
+        f"""SELECT table_id, row_id, count(*) FROM (
+                SELECT table_id, row_id, {GEO_COLUMN} FROM results
+                GROUP BY ALL HAVING count(*) > 1)
+            GROUP BY ALL ORDER BY ALL LIMIT 5"""
+    ).fetchall()
+    for table_id, row_id, n in repeated:
+        errors.append(
+            f"{table_id}/{row_id}: returns more than one row for {n} "
+            f"geograph{'y' if n == 1 else 'ies'}; with --spine each spec must "
+            f"give exactly one row per {GEO_COLUMN}"
+        )
+
+    # One pass over the results: which geographies appear at all, and which
+    # have something other than zero on at least one line.
+    nonzero = " OR ".join(f"coalesce({c}, 0) <> 0" for c in zero_fill)
+    con.execute(
+        f"""CREATE OR REPLACE TEMP TABLE result_geos AS
+            SELECT CAST({GEO_COLUMN} AS VARCHAR) AS {GEO_COLUMN},
+                   bool_or({nonzero}) AS has_nonzero
+            FROM results WHERE {GEO_COLUMN} IS NOT NULL GROUP BY ALL"""
+    )
+
+    n, shown = count_and_sample(con, f"""
+        SELECT {GEO_COLUMN} FROM spine WHERE {GEO_COLUMN} NOT IN
+            (SELECT {GEO_COLUMN} FROM result_geos WHERE has_nonzero)""")
+    if n:
+        warnings.append(
+            f"{n} spine geograph{'y is' if n == 1 else 'ies are'} zero on "
+            f"every line: {shown}. OK if empty geos, but also the signature "
+            f"of a mistyped geoid"
+        )
+
+    n, shown = count_and_sample(con, f"""
+        SELECT {GEO_COLUMN} FROM result_geos WHERE {GEO_COLUMN} NOT IN
+            (SELECT {GEO_COLUMN} FROM spine)""")
+    if n:
+        warnings.append(
+            f"{n} geograph{'y' if n == 1 else 'ies'} in the microdata "
+            f"{'is' if n == 1 else 'are'} not in the spine and "
+            f"{'is' if n == 1 else 'are'} left out of the output: {shown}"
+        )
+    return errors, warnings
+
+
+def build_lines_table(specs: list[QuerySpec]) -> str:
+    """Statement creating the temp table `lines`, one row per spec."""
+    rows = ",\n    ".join(
+        "(" + ", ".join(label_values(s, None)[c] for c in LINE_COLUMNS) + ")"
         for s in specs
     )
-    spine_rows = ",\n    ".join(f"({sql_literal(g)})" for g in spine)
+    return (f"CREATE OR REPLACE TEMP TABLE lines({', '.join(LINE_COLUMNS)}) AS\n"
+            f"  VALUES\n    {rows}")
 
-    fill = ",\n       ".join(
-        f"coalesce(r.{c}, 0) AS {c}" for c in zero_fill
+
+def build_densified(geo: str | None, zero_fill: list[str],
+                    labels: tuple[str, ...] = LABEL_COLUMNS,
+                    sort: bool = True) -> str:
+    """Query giving a row for every (line, spine geography) pair.
+
+    Reads the temp tables `lines`, `spine` and `results`. The line grid comes
+    from the SPECS, not from the results: a line that is zero in every
+    geography contributes nothing to the union, so deriving the grid from
+    results would drop it entirely. Likewise the spine is external because
+    the microdata can only name geographies that already contain someone.
+    Count measures are coalesced to 0; everything else stays NULL, since an
+    empty cell has a count of zero but an undefined mean.
+    """
+    select = ", ".join(
+        f"{sql_literal(geo)} AS geo_level" if c == "geo_level" else f"l.{c}"
+        for c in labels
     )
-    passthrough = "r.* EXCLUDE (table_id, row_id, row_desc, universe, geo_level, "
-    passthrough += f"{GEO_COLUMN}, {', '.join(zero_fill)})"
+    fill = ",\n       ".join(f"coalesce(r.{c}, 0) AS {c}" for c in zero_fill)
+    order = f"\nORDER BY s.{GEO_COLUMN}, l.table_id, l.row_id" if sort else ""
 
-    return f"""WITH results AS (
-{body}
-),
-lines(table_id, row_id, row_desc, universe) AS (
-  VALUES
-    {line_rows}
-),
-spine({GEO_COLUMN}) AS (
-  VALUES
-    {spine_rows}
-),
-grid AS (
-  SELECT l.table_id, l.row_id, l.row_desc, l.universe, s.{GEO_COLUMN}
-  FROM lines l CROSS JOIN spine s
-)
-SELECT g.table_id, g.row_id, g.row_desc, g.universe,
-       {sql_literal(geo)} AS geo_level,
-       g.{GEO_COLUMN},
+    return f"""SELECT {select},
+       s.{GEO_COLUMN},
        {fill},
-       {passthrough}
-FROM grid g
+       r.* EXCLUDE (table_id, row_id, {GEO_COLUMN}, {", ".join(zero_fill)})
+FROM lines l
+CROSS JOIN spine s
 LEFT JOIN results r
-  ON  r.table_id = g.table_id
-  AND r.row_id   = g.row_id
-  AND CAST(r.{GEO_COLUMN} AS VARCHAR) = g.{GEO_COLUMN}
-ORDER BY g.{GEO_COLUMN}, g.table_id, g.row_id"""
+  ON  r.table_id = l.table_id
+  AND r.row_id   = l.row_id
+  AND CAST(r.{GEO_COLUMN} AS VARCHAR) = s.{GEO_COLUMN}{order}"""
 
+
+# --------------------------------------------------------------------------
+# Running
+# --------------------------------------------------------------------------
 
 def register_source(con: duckdb.DuckDBPyConnection, source: SourceConfig) -> None:
-    kind = "TABLE" if source.materialize else "VIEW"
-    con.execute(
-        f"CREATE OR REPLACE {kind} {source.view} AS "
-        f"SELECT * FROM {source_reader(source.path)}",
-        [source.path],
-    )
+    """Make the microdata visible to the specs under the name `source.view`.
+
+    Parquet is left on disk as a VIEW: DuckDB then reads only the columns the
+    specs mention, so a wide national file never has to fit in memory. CSV is
+    loaded once into a TABLE, because re-parsing the text for every spec
+    would dominate the run. `source.materialize` overrides either default.
+    """
+    reader = source_reader(source.path).replace("?", sql_literal(source.path))
+    materialize = source.materialize
+    if materialize is None:
+        materialize = not reader.startswith("read_parquet")
+    kind = "TABLE" if materialize else "VIEW"
+    con.execute(f"CREATE OR REPLACE {kind} {source.view} AS SELECT * FROM {reader}")
+
+
+def write_results(con: duckdb.DuckDBPyConnection, query: str, out: Path) -> int:
+    """Stream a query's rows straight to a Parquet or CSV file; return how many.
+
+    DuckDB writes as it computes, so the rows never pass through Python.
+    """
+    parquet = out.suffix.lower() in PARQUET_SUFFIXES
+    file_format = "FORMAT PARQUET" if parquet else "FORMAT CSV, HEADER"
+    return con.execute(
+        f"COPY (\n{query}\n) TO {sql_literal(str(out))} ({file_format})"
+    ).fetchone()[0]
 
 
 # --------------------------------------------------------------------------
@@ -411,9 +556,20 @@ def main(argv: list[str] | None = None) -> int:
                          "Parquet (by extension)")
     ap.add_argument("--view", default="recs",
                     help="name the specs' SQL refers to")
-    ap.add_argument("--no-materialize", action="store_true",
-                    help="register source as a VIEW instead of a TABLE")
-    ap.add_argument("--out", type=Path, help="write results to this CSV")
+    ap.add_argument("--materialize", action=argparse.BooleanOptionalAction,
+                    help="load the source into an in-memory TABLE, or with "
+                         "--no-materialize query the file in place as a VIEW "
+                         "(default: table for CSV, view for Parquet)")
+    ap.add_argument("--out", type=Path,
+                    help="stream results to this file: Parquet if it ends in "
+                         ".parquet, otherwise CSV")
+    ap.add_argument("--labels", type=Path,
+                    help="write row_desc and universe once per line to this "
+                         "CSV, keyed by table_id/row_id, and leave them out "
+                         "of the results")
+    ap.add_argument("--no-sort", action="store_true",
+                    help="skip the final ORDER BY, which is costly on very "
+                         "large results")
     ap.add_argument("--check", action="store_true", help="validate only")
     ap.add_argument("--print-sql", action="store_true", help="print the master query")
     ap.add_argument("--geo",
@@ -429,7 +585,7 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     source = SourceConfig(
-        path=args.source, view=args.view, materialize=not args.no_materialize
+        path=args.source, view=args.view, materialize=args.materialize
     )
 
     try:
@@ -459,15 +615,19 @@ def main(argv: list[str] | None = None) -> int:
         print(SpecError(errors or warnings), file=sys.stderr)
         return 2
 
-    master = build_master(specs, args.geo, grouped)
+    labels = SLIM_LABEL_COLUMNS if args.labels else LABEL_COLUMNS
+    sort = not args.no_sort
+    setup: list[str] = []    # statements that must run before `query`
 
-    if args.spine:
+    if not args.spine:
+        query = build_master(specs, args.geo, grouped, labels, sort)
+    else:
         if not grouped:
             print("--spine requires geography-grouped specs (use --geo with "
                   "specs built for a geography)", file=sys.stderr)
             return 2
         try:
-            spine = load_spine(args.spine)
+            spine_size = load_spine(con, args.spine)
         except SpecError as exc:
             print(exc, file=sys.stderr)
             return 2
@@ -479,41 +639,47 @@ def main(argv: list[str] | None = None) -> int:
                   f"(measures found: {sorted(all_measures - {GEO_COLUMN})})",
                   file=sys.stderr)
             return 2
-        master = build_densified(specs, master, spine, args.geo, zero_fill)
+        # The un-filled results go to a temp table first, so they can be
+        # checked against the spine before anything is written.
+        setup = [
+            build_lines_table(specs),
+            "CREATE OR REPLACE TEMP TABLE results AS\n"
+            + build_master(specs, labels=("table_id", "row_id"), sort=False),
+        ]
+        query = build_densified(args.geo, zero_fill, labels, sort)
+
     if args.print_sql:
-        print(master)
+        print(";\n\n".join(setup + [query]))
     if args.check:
         print(f"{len(specs)} spec(s) OK", file=sys.stderr)
         return 0
 
-    df = con.execute(master).df()
+    if not sort:
+        # Lets DuckDB write rows as they are produced instead of buffering
+        # them to keep their order, which matters once results outgrow memory.
+        con.execute("SET preserve_insertion_order = false")
 
     if args.spine:
-        zf = [c for c in zero_fill if c in df.columns]
-        if zf:
-            dead = sorted(
-                g for g, sub in df.groupby(GEO_COLUMN)
-                if (sub[zf] == 0).all().all()
-            )
-            if dead:
-                shown = ", ".join(dead[:5]) + (" ..." if len(dead) > 5 else "")
-                print(f"warning: {len(dead)} spine geograph"
-                      f"{'y is' if len(dead) == 1 else 'ies are'} zero on "
-                      f"every line: {shown}. OK if empty geos, but also "
-                      f"the signature of a mistyped geoid", file=sys.stderr)
-        expected = len(specs) * len(spine)
-        if len(df) != expected:
-            print(f"error: densified output has {len(df)} rows, expected "
-                  f"{len(specs)} lines x {len(spine)} geographies = {expected}; "
-                  f"check for spine/microdata geoid mismatches",
-                  file=sys.stderr)
+        for statement in setup:
+            con.execute(statement)
+        errors, warnings = check_results_against_spine(con, zero_fill)
+        for w in warnings:
+            print(f"warning: {w}", file=sys.stderr)
+        if errors:
+            print(SpecError(errors), file=sys.stderr)
             return 2
 
+    if args.labels:
+        write_labels(specs, args.labels)
+        print(f"wrote {len(specs)} line labels to {args.labels}", file=sys.stderr)
+
     if args.out:
-        df.to_csv(args.out, index=False)
-        print(f"wrote {len(df)} rows to {args.out}", file=sys.stderr)
+        rows = write_results(con, query, args.out)
+        shape = (f" ({len(specs)} lines x {spine_size} geographies)"
+                 if args.spine else "")
+        print(f"wrote {rows} rows{shape} to {args.out}", file=sys.stderr)
     else:
-        print(df.to_string(index=False))
+        print(con.execute(query).df().to_string(index=False))
     return 0
 
 
